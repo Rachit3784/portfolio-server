@@ -35,9 +35,11 @@ mongoose
 /* ── Schemas ── */
 const ChatUserSchema = new mongoose.Schema(
   {
-    name:       { type: String, required: true, trim: true },
-    email:      { type: String, required: true, unique: true, lowercase: true, trim: true },
-    lastActive: { type: Date, default: Date.now },
+    name:           { type: String, required: true, trim: true },
+    email:          { type: String, required: true, unique: true, lowercase: true, trim: true },
+    activeDeviceId: { type: String, default: null },
+    notificationId: { type: String, default: null },
+    lastActive:     { type: Date, default: Date.now },
   },
   { timestamps: true }
 );
@@ -57,8 +59,10 @@ const ChatMessageSchema = new mongoose.Schema(
 const ChatUser    = mongoose.models.ChatUser || mongoose.model('ChatUser', ChatUserSchema);
 const ChatMessage = mongoose.models.ChatMessage || mongoose.model('ChatMessage', ChatMessageSchema);
 
-/* ── Active WebRTC Calls Map (userId -> peerId) ── */
+/* ── Active WebRTC Calls Map (userId -> peerId) & Active Admin Device ── */
 const activeCalls = new Map(); // tracks who is in an active call
+let adminActiveDeviceId = null;
+let adminNotificationId = null;
 
 /* ── HTTP API Routes ── */
 app.get('/', (req, res) => {
@@ -67,13 +71,25 @@ app.get('/', (req, res) => {
 
 // Admin Login
 app.post('/api/admin/login', (req, res) => {
-  const { email, password } = req.body;
+  const { email, password, deviceId, notificationId } = req.body;
   if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
   if (email.trim().toLowerCase() === ADMIN_EMAIL && password === ADMIN_PASSWORD) {
+    // Single active device session for Admin
+    if (adminActiveDeviceId && adminActiveDeviceId !== deviceId) {
+      console.log(`⚠️ Admin logged in from another device (${deviceId}). Invalidating previous admin device (${adminActiveDeviceId}).`);
+      io.to('admin_room').emit('admin_session_invalidated', {
+        invalidatedDeviceId: adminActiveDeviceId,
+        newDeviceId: deviceId,
+        message: 'Admin session logged in on another device or browser. Session cleared.',
+      });
+    }
+    if (deviceId) adminActiveDeviceId = deviceId;
+    if (notificationId) adminNotificationId = notificationId;
+
     return res.json({
       success: true,
-      admin: { email: ADMIN_EMAIL, name: 'Rachit Gupta (Super Admin)', role: 'super_admin' },
+      admin: { email: ADMIN_EMAIL, name: 'Rachit Gupta (Super Admin)', role: 'super_admin', deviceId },
     });
   }
   return res.status(401).json({ error: 'Invalid Admin credentials' });
@@ -82,7 +98,7 @@ app.post('/api/admin/login', (req, res) => {
 // Recruiter Auth Check
 app.post('/api/auth/check-user', async (req, res) => {
   try {
-    const { email, name, create } = req.body;
+    const { email, name, create, deviceId, notificationId } = req.body;
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
     const normalizedEmail = email.trim().toLowerCase();
@@ -91,28 +107,80 @@ app.post('/api/auth/check-user', async (req, res) => {
       return res.status(403).json({ error: 'This email is reserved for Super Admin login only.' });
     }
 
+    let user = await ChatUser.findOne({ email: normalizedEmail });
+
     if (create) {
       if (!name || name.trim().length < 2) {
         return res.status(400).json({ error: 'Name must be at least 2 characters' });
       }
-      let user = await ChatUser.findOne({ email: normalizedEmail });
       if (!user) {
-        user = await ChatUser.create({ email: normalizedEmail, name: name.trim() });
+        user = await ChatUser.create({
+          email: normalizedEmail,
+          name: name.trim(),
+          activeDeviceId: deviceId || null,
+          notificationId: notificationId || null,
+        });
       }
-      return res.json({ exists: true, user: { id: user._id, name: user.name, email: user.email } });
     }
 
-    const user = await ChatUser.findOne({ email: normalizedEmail });
     if (user) {
+      // Check if logged in on another device/browser
+      if (user.activeDeviceId && deviceId && user.activeDeviceId !== deviceId) {
+        console.log(`⚠️ Email ${normalizedEmail} opened on new device (${deviceId}). Clearing previous device (${user.activeDeviceId}).`);
+        io.to(`user_${user._id}`).emit('session_invalidated', {
+          userId: user._id,
+          email: user.email,
+          invalidatedDeviceId: user.activeDeviceId,
+          newDeviceId: deviceId,
+          message: 'Your session has been opened in another browser/device. Please allow notifications & login again if you want to switch back.',
+        });
+      }
+
+      // Attach new active device & notification ID, deleting old ones
+      user.activeDeviceId = deviceId || user.activeDeviceId;
+      user.notificationId = notificationId || user.notificationId;
       user.lastActive = new Date();
       await user.save();
-      return res.json({ exists: true, user: { id: user._id, name: user.name, email: user.email } });
+
+      return res.json({
+        exists: true,
+        user: {
+          id: user._id,
+          name: user.name,
+          email: user.email,
+          activeDeviceId: user.activeDeviceId,
+          notificationId: user.notificationId,
+        },
+      });
     }
 
     return res.json({ exists: false });
 
   } catch (err) {
     console.error('[check-user error]', err);
+    return res.status(500).json({ error: 'Server error' });
+  }
+});
+
+// Logout endpoint to clear session & notification ID in MongoDB
+app.post('/api/auth/logout', async (req, res) => {
+  try {
+    const { email, deviceId } = req.body;
+    if (!email) return res.status(400).json({ error: 'Email is required' });
+
+    const normalizedEmail = email.trim().toLowerCase();
+    const user = await ChatUser.findOne({ email: normalizedEmail });
+    if (user) {
+      if (!deviceId || user.activeDeviceId === deviceId) {
+        user.activeDeviceId = null;
+        user.notificationId = null;
+        await user.save();
+        console.log(`🚪 Session & Notification ID cleared in DB for email: ${normalizedEmail}`);
+      }
+    }
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('[logout error]', err);
     return res.status(500).json({ error: 'Server error' });
   }
 });
@@ -171,16 +239,42 @@ app.get('/api/chat/history', async (req, res) => {
 io.on('connection', (socket) => {
   console.log(`⚡ Client connected: ${socket.id}`);
 
-  socket.on('join_room', ({ userId, role }) => {
+  socket.on('join_room', async ({ userId, role, deviceId, notificationId }) => {
     if (!userId) return;
+    socket.deviceId = deviceId;
+
     if (role === 'admin') {
       socket.join('admin_room');
       socket.userId = 'admin';
-      console.log(`👑 Super Admin joined: admin_room`);
+      console.log(`👑 Super Admin joined: admin_room (Device: ${deviceId})`);
+
+      if (adminActiveDeviceId && deviceId && adminActiveDeviceId !== deviceId) {
+        socket.emit('admin_session_invalidated', {
+          invalidatedDeviceId: deviceId,
+          message: 'Another admin session is active on a different device.',
+        });
+      }
     } else {
       socket.join(`user_${userId}`);
       socket.userId = userId;
-      console.log(`👤 Recruiter joined: user_${userId}`);
+      console.log(`👤 Recruiter joined: user_${userId} (Device: ${deviceId})`);
+
+      // Verify active device in DB
+      try {
+        const dbUser = await ChatUser.findById(userId);
+        if (dbUser && dbUser.activeDeviceId && deviceId && dbUser.activeDeviceId !== deviceId) {
+          console.log(`⚠️ Socket device mismatch for user_${userId}. Emitting session_invalidated to socket ${socket.id}`);
+          socket.emit('session_invalidated', {
+            userId: dbUser._id,
+            email: dbUser.email,
+            invalidatedDeviceId: deviceId,
+            newDeviceId: dbUser.activeDeviceId,
+            message: 'Session active on another device.',
+          });
+        }
+      } catch (e) {
+        console.error('[join_room check error]', e);
+      }
     }
   });
 
